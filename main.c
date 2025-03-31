@@ -435,6 +435,36 @@ void *packet_capture_thread(void *arg) {
     return NULL;
 }
 
+void clean_up(unsigned char *target_mac, unsigned char *gateway_mac) {
+    printf("Restoring ARP tables...\n");
+    arp_packet restore_packet;
+    struct sockaddr_ll device;
+
+    memset(&device, 0, sizeof(device));
+    device.sll_family = AF_PACKET;
+    device.sll_ifindex = get_if_index(interface);
+    device.sll_halen = ETH_ALEN;
+    memcpy(device.sll_addr, target_mac, 6);
+
+    memset(&restore_packet, 0, sizeof(restore_packet));
+    memset(&restore_packet.eth.dest_mac, target_mac, 6);
+    memcpy(restore_packet.eth.src_mac, gateway_mac, 6);
+
+    restore_packet.eth.ether_type = htons(ETH_P_ARP);
+    restore_packet.arp.hardware_type = htons(ARPHRD_ETHER);
+    restore_packet.arp.protocol_type = htons(ETH_P_IP);
+    restore_packet.arp.hardware_size = 6;
+    restore_packet.arp.protocol_size = 4;
+    restore_packet.arp.opcode = htons(ARP_REPLY);
+
+    memcpy(restore_packet.arp.sender_mac, gateway_mac, 6);
+    memcpy(restore_packet.arp.sender_ip, gateway_ip, 4);
+    memcpy(restore_packet.arp.target_mac, target_mac, 6);
+    memcpy(restore_packet.arp.target_ip, target_ip, 4);
+
+    if (sendto(raw_socket, &restore_packet, sizeof(restore_packet), 0, (struct sockaddr*)&device, sizeof(device)) < 0) perror("sendto");
+}
+
 int main(int argc, char *argv[]) {
     if (argc != 4) {
         printf("Usage: %s <interface> <target_ip> <gateway_ip>\n", argv[0]);
@@ -521,6 +551,7 @@ int main(int argc, char *argv[]) {
     
     pthread_join(spoof_thread, NULL);
     pthread_join(capture_thread, NULL);
+    clean_up(target_mac, gateway_mac);
     close(raw_socket);
     printf("Attack terminated.\n");
     
