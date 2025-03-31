@@ -546,7 +546,6 @@ int main(int argc, char *argv[]) {
     printf(" and ");
     printf("%d.%d.%d.%d", gateway_ip[0], gateway_ip[1], gateway_ip[2], gateway_ip[3]);
     printf("\n");
-    printf("HTTP URL extraction is active\n");
     printf("\nPress Ctrl+C to stop the attack\n");
     
     pthread_join(spoof_thread, NULL);
